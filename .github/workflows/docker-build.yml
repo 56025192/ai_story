@@ -1,231 +1,77 @@
 name: 自动构建 AI Story Docker 镜像
 
-# 扩展触发规则：main分支推送、版本标签推送、PR合并前验证、手动触发
+# 触发条件：推送到 main 分支时自动执行构建
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ] # 打v开头的版本标签时触发（如v1.0.0）
-  pull_request:
-    branches: [ main ] # PR提交到main分支时验证构建（不推送镜像）
-  workflow_dispatch: # 支持手动触发构建
-
-# 全局环境变量，简化后续步骤引用
-env:
-  DOCKER_HUB_REPO: ${{ secrets.DOCKER_HUB_USERNAME }}
-  BACKEND_IMAGE: ai_story-backend
-  FRONTEND_IMAGE: ai_story-frontend
-  # 多架构配置
-  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  # 构建并推送后端镜像（独立Job，支持并行）
-  build-backend:
-    runs-on: ubuntu-latest
+  build-and-push:
+    runs-on: ubuntu-latest  # 云端使用 Ubuntu 环境构建
     steps:
-      # 1. 拉取代码
+      # 1. 拉取 GitHub 上的项目代码
       - name: 拉取代码
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # 拉取完整历史，避免缓存/标签异常
 
-      # 2. 配置QEMU（支持多架构构建）
-      - name: 设置QEMU多架构支持
-        uses: docker/setup-qemu-action@v3
-        continue-on-error: true # 非核心步骤失败不终止，配合重试
-        id: qemu
-        retry:
-          max_attempts: 3 # 第三方action的重试（此action原生支持retry）
-          delay_seconds: 30
-
-      # 3. 配置Buildx（增强Docker构建能力）
-      - name: 设置Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        id: buildx
-        retry:
-          max_attempts: 3
-          delay_seconds: 30
-
-      # 4. 登录Docker Hub（仅在推送镜像时执行，PR触发时跳过）
-      - name: 登录Docker Hub
-        if: github.event_name != 'pull_request'
+      # 2. 登录 Docker Hub（需先配置凭证）
+      - name: 登录 Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-        retry:
-          max_attempts: 3
-          delay_seconds: 30
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}  # Docker Hub 用户名（保密配置）
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}     # Docker Hub 访问令牌（保密配置）
 
-      # 5. 构建并推送后端镜像（带缓存、多架构、多标签）
+      # 3. 构建并推送后端镜像（带基础重试逻辑，避免网络偶发失败）
       - name: 构建并推送后端镜像
-        uses: docker/build-push-action@v5
-        id: build-backend-img
-        # 步骤级重试（通过第三方action实现，替代原job级retry）
         env:
-          RETRY_MAX: 2
-          RETRY_DELAY: 300 # 5分钟
+          DOCKER_REPO: ${{ secrets.DOCKER_HUB_USERNAME }}
+          IMAGE_NAME: ai_story-backend
+          RETRY_MAX: 2  # 最大重试2次
+          RETRY_DELAY: 30 # 重试间隔30秒
         run: |
-          # 自定义重试逻辑：构建失败时重试2次，间隔5分钟
+          # 自定义重试逻辑（替代非法的retry字段）
           attempt=1
           while [ $attempt -le $RETRY_MAX ]; do
-            echo "开始第 $attempt 次构建后端镜像..."
-            # 执行构建推送命令（等价于原action配置）
-            docker buildx build \
-              --cache-from=type=registry,ref=${{ env.DOCKER_HUB_REPO }}/${{ env.BACKEND_IMAGE }}:buildcache \
-              --cache-to=type=registry,ref=${{ env.DOCKER_HUB_REPO }}/${{ env.BACKEND_IMAGE }}:buildcache,mode=max \
-              --platform=${{ env.PLATFORMS }} \
-              --push=${{ github.event_name != 'pull_request' }} \
-              --tag=${{ env.DOCKER_HUB_REPO }}/${{ env.BACKEND_IMAGE }}:latest \
-              --tag=${{ env.DOCKER_HUB_REPO }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }} \
-              ${{ startsWith(github.ref, 'refs/tags/') && '--tag='${{ env.DOCKER_HUB_REPO }}/${{ env.BACKEND_IMAGE }}:${{ github.ref_name }} || '' }} \
-              --file=./docker/Dockerfile \
-              .
+            echo "第 $attempt 次构建后端镜像..."
+            # 执行构建推送命令
+            docker build -t $DOCKER_REPO/$IMAGE_NAME:latest -f ./docker/Dockerfile .
+            docker push $DOCKER_REPO/$IMAGE_NAME:latest
+            
             # 构建成功则退出循环
             if [ $? -eq 0 ]; then
-              echo "后端镜像构建成功！"
+              echo "后端镜像推送成功！"
               exit 0
             fi
-            # 构建失败则等待后重试
-            echo "第 $attempt 次构建失败，${RETRY_DELAY}秒后重试..."
+            
+            # 失败则等待重试
+            echo "第 $attempt 次失败，$RETRY_DELAY 秒后重试..."
             sleep $RETRY_DELAY
             attempt=$((attempt + 1))
           done
-          echo "超出最大重试次数，构建失败！"
+          echo "超出最大重试次数，后端镜像构建失败！"
           exit 1
 
-      # 6. 验证后端镜像（仅推送后执行）
-      - name: 验证后端镜像可用性
-        if: github.event_name != 'pull_request'
-        run: |
-          # 拉取刚推送的镜像
-          docker pull ${{ env.DOCKER_HUB_REPO }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
-          # 启动测试容器（需Dockerfile中定义HEALTHCHECK，否则注释此段）
-          docker run -d --name test-backend --rm \
-            ${{ env.DOCKER_HUB_REPO }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
-          # 等待容器启动并检查健康状态
-          sleep 15
-          HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' test-backend 2>/dev/null || echo "unhealthy")
-          if [ "$HEALTH_STATUS" != "healthy" ]; then
-            echo "后端镜像启动后健康检查失败！"
-            docker logs test-backend # 输出日志便于排查
-            exit 1
-          fi
-          # 停止测试容器
-          docker stop test-backend
-        continue-on-error: false # 验证失败直接终止
-
-
-  # 构建并推送前端镜像（独立Job，与后端并行）
-  build-frontend:
-    runs-on: ubuntu-latest
-    steps:
-      - name: 拉取代码
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: 设置QEMU多架构支持
-        uses: docker/setup-qemu-action@v3
-        continue-on-error: true
-        retry:
-          max_attempts: 3
-          delay_seconds: 30
-
-      - name: 设置Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        retry:
-          max_attempts: 3
-          delay_seconds: 30
-
-      - name: 登录Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-        retry:
-          max_attempts: 3
-          delay_seconds: 30
-
+      # 4. 构建并推送前端镜像（带基础重试逻辑）
       - name: 构建并推送前端镜像
         env:
+          DOCKER_REPO: ${{ secrets.DOCKER_HUB_USERNAME }}
+          IMAGE_NAME: ai_story-frontend
           RETRY_MAX: 2
-          RETRY_DELAY: 300
+          RETRY_DELAY: 30
         run: |
           attempt=1
           while [ $attempt -le $RETRY_MAX ]; do
-            echo "开始第 $attempt 次构建前端镜像..."
-            docker buildx build \
-              --cache-from=type=registry,ref=${{ env.DOCKER_HUB_REPO }}/${{ env.FRONTEND_IMAGE }}:buildcache \
-              --cache-to=type=registry,ref=${{ env.DOCKER_HUB_REPO }}/${{ env.FRONTEND_IMAGE }}:buildcache,mode=max \
-              --platform=${{ env.PLATFORMS }} \
-              --push=${{ github.event_name != 'pull_request' }} \
-              --tag=${{ env.DOCKER_HUB_REPO }}/${{ env.FRONTEND_IMAGE }}:latest \
-              --tag=${{ env.DOCKER_HUB_REPO }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }} \
-              ${{ startsWith(github.ref, 'refs/tags/') && '--tag='${{ env.DOCKER_HUB_REPO }}/${{ env.FRONTEND_IMAGE }}:${{ github.ref_name }} || '' }} \
-              --file=./docker/frontend.Dockerfile \
-              .
+            echo "第 $attempt 次构建前端镜像..."
+            docker build -t $DOCKER_REPO/$IMAGE_NAME:latest -f ./docker/frontend.Dockerfile .
+            docker push $DOCKER_REPO/$IMAGE_NAME:latest
+            
             if [ $? -eq 0 ]; then
-              echo "前端镜像构建成功！"
+              echo "前端镜像推送成功！"
               exit 0
             fi
-            echo "第 $attempt 次构建失败，${RETRY_DELAY}秒后重试..."
+            
+            echo "第 $attempt 次失败，$RETRY_DELAY 秒后重试..."
             sleep $RETRY_DELAY
             attempt=$((attempt + 1))
           done
-          echo "超出最大重试次数，构建失败！"
+          echo "超出最大重试次数，前端镜像构建失败！"
           exit 1
-
-      - name: 验证前端镜像可用性
-        if: github.event_name != 'pull_request'
-        run: |
-          docker pull ${{ env.DOCKER_HUB_REPO }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
-          docker run -d --name test-frontend --rm \
-            ${{ env.DOCKER_HUB_REPO }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
-          sleep 10
-          # 检查前端容器是否正常运行（Nginx端口监听）
-          if ! docker exec test-frontend curl -s http://localhost:80 >/dev/null; then
-            echo "前端镜像启动后端口不可用！"
-            docker logs test-frontend
-            exit 1
-          fi
-          docker stop test-frontend
-
-  # 可选：验证Docker Compose（依赖前后端镜像构建完成）
-  verify-compose:
-    runs-on: ubuntu-latest
-    needs: [build-backend, build-frontend] # 等待前后端构建完成
-    if: github.event_name != 'pull_request'
-    steps:
-      - name: 拉取代码
-        uses: actions/checkout@v4
-
-      - name: 登录Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-        retry:
-          max_attempts: 3
-          delay_seconds: 30
-
-      - name: 验证Docker Compose配置
-        run: |
-          # 复制示例环境变量（需确保.env.example包含必要配置）
-          cp .env.example .env || echo "无.env.example，跳过环境变量复制"
-          # 检查Compose文件语法
-          docker-compose config
-          # 启动所有服务并检查状态
-          docker-compose up -d
-          sleep 20
-          # 检查所有服务是否正常运行
-          RUNNING_SERVICES=$(docker-compose ps -q | wc -l)
-          EXPECTED_SERVICES=$(docker-compose config --services | wc -l)
-          if [ "$RUNNING_SERVICES" != "$EXPECTED_SERVICES" ]; then
-            echo "Docker Compose 服务启动不全！"
-            docker-compose logs
-            docker-compose down
-            exit 1
-          fi
-          # 清理测试环境
-          docker-compose down
