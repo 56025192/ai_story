@@ -19,4 +19,3 @@ Write short imperative commit subjects under roughly 60 characters (module prefi
 
 ## Security & Configuration Tips
 Copy `.env.example` to `.env`, inject keys locally, and avoid committing them; Django reads env vars from that file. Keep generated media in `storage/` or external buckets, prune stale files, rotate provider credentials through the admin UI, and keep logs free of raw secrets.
-.
