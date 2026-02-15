@@ -1,42 +1,90 @@
 version: '3.8'
 
 services:
-
-  # Redis缓存和消息队列
+  # Redis缓存和消息队列（适配Pub/Sub场景，关闭持久化 + 指定挂载路径）
   redis:
     image: redis:7-alpine
-
-
-  # Django后端
-  backend:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    environment:
-      - DJANGO_SETTINGS_MODULE=config.settings.production
-      - REDIS_HOST=redis
-    depends_on:
-      - redis
-
-  # Celery Worker
-  celery:
-    image: ai_story-backend
-    command: celery -A config worker -l info
+    # 挂载宿主机/vol2/1000/video/redis到容器/data（按需求指定路径）
     volumes:
-      - ./backend:/app
+      - /vol2/1000/video/redis:/data
+    # 项目要求：Pub/Sub场景关闭Redis持久化（关键配置）
+    command: redis-server --save "" --appendonly no
+    # 资源限制 + 异常重启
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    restart: unless-stopped
+    networks:
+      - ai_story_network
+
+  # Django后端（使用已构建镜像 + 媒体文件持久化）
+  backend:
+    image: 56025192/ai_story-backend:latest
     environment:
       - DJANGO_SETTINGS_MODULE=config.settings.production
       - REDIS_HOST=redis
+      - REDIS_PUBSUB_URL=redis://redis:6379/2  # 匹配项目Redis配置
+      - STORAGE_ROOT=/app/storage  # 容器内存储根目录
+      - DEBUG=False
+    # 后端API端口映射（根据ASGI配置调整，默认8010）
+    ports:
+      - "8010:8010"
     depends_on:
       - redis
+    # 挂载宿主机/vol2/1000/video到容器storage（包含视频/图片等媒体文件）
+    volumes:
+      - /vol2/1000/video:/app/storage/video
+      - /vol2/1000/video/image:/app/storage/image
+      - /vol2/1000/video/audio:/app/storage/audio
+    # 健康检查确保服务可用
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - ai_story_network
 
-  # Vue前端
+  # Celery Worker（复用后端镜像 + 共享媒体文件挂载）
+  celery:
+    image: 56025192/ai_story-backend:latest
+    # 匹配项目要求：指定llm/image/video队列，提升任务处理效率
+    command: celery -A config worker -Q llm,image,video -l info
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings.production
+      - REDIS_HOST=redis
+      - REDIS_PUBSUB_URL=redis://redis:6379/2
+      - STORAGE_ROOT=/app/storage
+    depends_on:
+      - redis
+      - backend
+    # 共享媒体文件挂载（与后端一致）
+    volumes:
+      - /vol2/1000/video:/app/storage/video
+      - /vol2/1000/video/image:/app/storage/image
+      - /vol2/1000/video/audio:/app/storage/audio
+    restart: unless-stopped
+    networks:
+      - ai_story_network
+
+  # Vue前端（使用已构建镜像）
   frontend:
-    build:
-      context: .
-      dockerfile: docker/frontend.Dockerfile
+    image: 56025192/ai_story-frontend:latest
     ports:
       - "3000:3000"
+    environment:
+      # 前端API地址指向后端容器
+      - VUE_APP_API_BASE_URL=http://backend:8010/api
     depends_on:
       - backend
+    restart: unless-stopped
+    networks:
+      - ai_story_network
 
+# 自定义网络隔离服务
+networks:
+  ai_story_network:
+    driver: bridge
