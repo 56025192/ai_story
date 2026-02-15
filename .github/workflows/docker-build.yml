@@ -1,0 +1,39 @@
+name: 自动构建 AI Story Docker 镜像
+
+# 触发条件：推送到 main 分支时自动执行构建
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest  # 云端使用 Ubuntu 环境构建
+    steps:
+      # 1. 拉取 GitHub 上的项目代码
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      # 2. 登录 Docker Hub（需先配置凭证）
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}  # Docker Hub 用户名（保密配置）
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}     # Docker Hub 访问令牌（保密配置）
+
+      # 3. 构建并推送后端镜像（对应 docker/Dockerfile）
+      - name: 构建并推送后端镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .                # 构建上下文：项目根目录（必须）
+          file: ./docker/Dockerfile # 后端 Dockerfile 路径
+          push: true                # 构建后推送到 Docker Hub
+          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/ai_story-backend:latest
+
+      # 4. 构建并推送前端镜像（对应 docker/frontend.Dockerfile）
+      - name: 构建并推送前端镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/frontend.Dockerfile # 前端 Dockerfile 路径
+          push: true
+          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/ai_story-frontend:latest
